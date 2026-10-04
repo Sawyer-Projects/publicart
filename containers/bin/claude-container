@@ -1,0 +1,276 @@
+#!/bin/bash
+# claude-container: run several Claude Desktop accounts side by side on one Mac, each in its
+# own "container" with its own sign-in, sessions, icon colour and window border.
+#
+#   claude-container make <Name> --hue <0-359|auto> [--dry-run]   build a new container
+#   claude-container list                                         what exists, and what is running
+#   claude-container check                                        find the failure modes in README
+#   claude-container borders                                      colour each container's windows once
+#   claude-container suggest-hue                                  the most distinct free colour
+#   claude-container colour <hue>                                 the border hex for a hue
+#
+# A container is a tiny wrapper .app around the ONE vendor /Applications/Claude.app. It sets
+# three environment variables and a --user-data-dir, then execs the vendor binary. There is no
+# vendor multi-account support; this is the whole trick. See README.md before your first make.
+set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+SELF="$(/usr/bin/python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")"
+KIT="$(cd "$(dirname "$SELF")/.." && pwd)"
+CLAUDE_APP="${CLAUDE_APP:-/Applications/Claude.app}"   # the one vendor app every container execs
+APPS_DIR="${APPS_DIR:-$HOME/Applications}"              # where container bundles live
+STATE="${CC_STATE:-$HOME/.local/share/claude-containers}"
+BORDER_WIDTH="${CC_BORDER_WIDTH:-12.0}"
+PY=/usr/bin/python3
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+die(){ echo "claude-container: $*" >&2; exit 1; }
+lower(){ printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+# One naming rule, used everywhere. Changing a name later is NOT a rename of three strings:
+# session records store absolute paths under the data dir (README, "Never rename casually").
+bundle_of(){ printf '%s/Claude %s.app' "$APPS_DIR" "$1"; }
+data_of(){   printf '%s/Library/Application Support/Claude-%s' "$HOME" "$1"; }
+config_of(){ printf '%s/.claude-%s' "$HOME" "$(lower "$1")"; }
+plist_get(){ /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist" 2>/dev/null; }
+
+# Discovery, never a list: a container is any bundle in APPS_DIR carrying ClaudeContainerHue.
+# Prints "<Name>\t<hue>" per container. Every other command reads this, so adding a container
+# never means editing a table somewhere else.
+discover(){
+  local b n h
+  for b in "$APPS_DIR"/*.app; do
+    [ -d "$b" ] || continue
+    h="$(plist_get "$b" ClaudeContainerHue)" || continue
+    h="$(printf '%s' "$h" | sed -E 's/\.?0+$//')"; [ -n "$h" ] || h=0   # PlistBuddy prints reals as 200.000000
+    n="$(plist_get "$b" ClaudeContainerName)" || continue
+    printf '%s\t%s\n' "$n" "$h"
+  done
+}
+
+# Colour maths in one place: hue -> border hex, and hue suggestions by perceptual distance.
+colour_py(){ "$PY" - "$@" <<'PYEOF'
+import colorsys, math, sys
+S, V = 0.839, 0.878          # every container shares one saturation and brightness; only hue varies
+def hexof(h): return "%02x%02x%02x" % tuple(round(c*255) for c in colorsys.hsv_to_rgb((h%360)/360, S, V))
+def lab(h):
+    rgb = colorsys.hsv_to_rgb((h%360)/360, S, V)
+    lin = [c/12.92 if c <= 0.04045 else ((c+0.055)/1.055)**2.4 for c in rgb]
+    r, g, b = lin
+    X = (0.4124*r+0.3576*g+0.1805*b)/0.95047; Y = 0.2126*r+0.7152*g+0.0722*b; Z = (0.0193*r+0.1192*g+0.9505*b)/1.08883
+    f = lambda t: t**(1/3) if t > 0.008856 else 7.787*t+16/116
+    return 116*f(Y)-16, 500*(f(X)-f(Y)), 200*(f(Y)-f(Z))
+def de2000(p, q):   # CIEDE2000: hue angle alone misleads (greens crowd, magenta sits near purple)
+    L1,a1,b1 = p; L2,a2,b2 = q
+    C1, C2 = math.hypot(a1,b1), math.hypot(a2,b2); Cm = (C1+C2)/2
+    G = 0.5*(1-math.sqrt(Cm**7/(Cm**7+25**7))); a1p, a2p = (1+G)*a1, (1+G)*a2
+    C1p, C2p = math.hypot(a1p,b1), math.hypot(a2p,b2)
+    h1 = math.degrees(math.atan2(b1,a1p)) % 360; h2 = math.degrees(math.atan2(b2,a2p)) % 360
+    dL, dC = L2-L1, C2p-C1p; dh = h2-h1
+    if C1p*C2p == 0: dh = 0
+    elif dh > 180: dh -= 360
+    elif dh < -180: dh += 360
+    dH = 2*math.sqrt(C1p*C2p)*math.sin(math.radians(dh/2)); Lm = (L1+L2)/2; Cmp = (C1p+C2p)/2
+    hm = h1+h2 if C1p*C2p == 0 else ((h1+h2)/2 if abs(h1-h2) <= 180 else (h1+h2+360)/2)
+    T = (1-0.17*math.cos(math.radians(hm-30))+0.24*math.cos(math.radians(2*hm))
+         +0.32*math.cos(math.radians(3*hm+6))-0.20*math.cos(math.radians(4*hm-63)))
+    SL = 1+0.015*(Lm-50)**2/math.sqrt(20+(Lm-50)**2); SC = 1+0.045*Cmp; SH = 1+0.015*Cmp*T
+    RT = -2*math.sqrt(Cmp**7/(Cmp**7+25**7))*math.sin(math.radians(60*math.exp(-((hm-275)/25)**2)))
+    return math.sqrt((dL/SL)**2+(dC/SC)**2+(dH/SH)**2+RT*(dC/SC)*(dH/SH))
+cmd, args = sys.argv[1], [float(a) for a in sys.argv[2:]]
+if cmd == "hex": print(hexof(args[0]))
+elif cmd == "suggest":             # args: hues already taken (the vendor icon's own orange counts)
+    taken = args
+    best = max(range(360), key=lambda h: min(de2000(lab(h), lab(t)) for t in taken))
+    print(best, round(min(de2000(lab(best), lab(t)) for t in taken), 1))
+elif cmd == "nearest":             # args: candidate, then the others -> smallest distance
+    print(round(min((de2000(lab(args[0]), lab(t)) for t in args[1:]), default=999), 1))
+PYEOF
+}
+
+# The plain vendor app is orange (hue ~15) and usually still runs beside the containers, so it counts.
+taken_hues(){ { discover | cut -f2; echo 15; } | tr '\n' ' '; }
+
+cmd_make(){
+  local NAME="" HUE="" DRY=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --hue) HUE="${2:-}"; shift 2;; --dry-run) DRY=1; shift;;
+    -*) die "unknown option $1";; *) [ -z "$NAME" ] && NAME="$1" || die "one name only"; shift;;
+  esac; done
+  [ -n "$NAME" ] || die "usage: make <Name> --hue <0-359|auto>"
+  [[ "$NAME" =~ ^[A-Za-z][A-Za-z0-9]{0,15}$ ]] || die "name must be letters/digits, starting with a letter, 16 max"
+  [ -n "$HUE" ] || die "--hue is required (a number 0-359, or auto)"
+  if [ "$HUE" = auto ]; then read -r HUE _ <<<"$(colour_py suggest $(taken_hues))"; fi
+  [[ "$HUE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && "$PY" -c "import sys;sys.exit(not 0<=float('$HUE')<360)" || die "--hue must be 0-359"
+  local APP DATA CONF LOW ICON HEX NEAR
+  APP="$(bundle_of "$NAME")"; DATA="$(data_of "$NAME")"; CONF="$(config_of "$NAME")"; LOW="$(lower "$NAME")"
+  [ -d "$CLAUDE_APP" ] || die "vendor app not found at $CLAUDE_APP (install Claude Desktop first)"
+  ICON="$CLAUDE_APP/Contents/Resources/$(plist_get "$CLAUDE_APP" CFBundleIconFile | sed 's/\.icns$//').icns"
+  [ -f "$ICON" ] || die "vendor icon not found: $ICON"
+  # Never build over anything: an existing data or config dir means an account already lives there.
+  for p in "$APP" "$DATA" "$CONF"; do [ -e "$p" ] && die "already exists, refusing to overwrite: $p"; done
+  discover | cut -f1 | tr '[:upper:]' '[:lower:]' | grep -qx "$LOW" && die "a container named $NAME (any case) exists"
+  HEX="$(colour_py hex "$HUE")"; NEAR="$(colour_py nearest "$HUE" $(taken_hues))"
+  echo "container $NAME  hue $HUE  border #$HEX  (distance to nearest existing colour: $NEAR; under 10 is hard to tell apart)"
+  echo "  bundle  $APP"; echo "  data    $DATA"; echo "  config  $CONF"
+  [ "$DRY" = 1 ] && { echo "dry run: nothing written"; return 0; }
+
+  mkdir -p "$CONF" "$DATA" "$APP/Contents/MacOS" "$APP/Contents/Resources"
+  # Retention: without settings.json Claude Code prunes transcripts after its default window.
+  # MCP_DISCOVERY_CACHE: MCP servers connect on first use, not at launch, so one that is slow at
+  # launch is not dead for the whole session. CLAUDE_CODE_RETRY_WATCHDOG: a turn that hits a usage
+  # limit holds and continues at the reset instead of ending on the limit card.
+  [ -f "$CONF/settings.json" ] || cat > "$CONF/settings.json" <<'JSON'
+{
+  "cleanupPeriodDays": 3650,
+  "env": {
+    "CLAUDE_CODE_RETRY_WATCHDOG": "1",
+    "MCP_DISCOVERY_CACHE": "1"
+  }
+}
+JSON
+  cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>	<string>Claude $NAME</string>
+	<key>CFBundleName</key>	<string>Claude $NAME</string>
+	<key>CFBundleExecutable</key>	<string>launcher</string>
+	<key>CFBundleIconFile</key>	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>	<string>local.claude-container.$LOW</string>
+	<key>CFBundlePackageType</key>	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>	<string>1.0</string>
+	<key>LSMinimumSystemVersion</key>	<string>11.0</string>
+	<key>ClaudeContainerName</key>	<string>$NAME</string>
+	<key>ClaudeContainerHue</key>	<real>$HUE</real>
+</dict>
+</plist>
+PLIST
+  # No CFBundleURLTypes on purpose: claude:// is ONE system-wide handler owned by the vendor app.
+  cat > "$APP/Contents/MacOS/launcher" <<LAUNCH
+#!/bin/bash
+# Container "$NAME", generated by claude-container. codesign seals this file: never leave
+# backups or extra files in Contents/MacOS, or the bundle will no longer verify.
+export CLAUDE_DATA_DIR="\$HOME/Library/Application Support/Claude-$NAME"
+export CLAUDE_CONFIG_DIR="\$HOME/.claude-$LOW"            # Claude Code: transcripts, settings, login
+export CLAUDE_SECURESTORAGE_CONFIG_DIR="\$CLAUDE_CONFIG_DIR"
+mkdir -p "\$CLAUDE_DATA_DIR" "\$CLAUDE_CONFIG_DIR"
+ARCH=(); [ "\$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ] && ARCH=(/usr/bin/arch -arm64)
+# The three --disable flags keep a container working while its window is hidden or behind others.
+exec "\${ARCH[@]}" "$CLAUDE_APP/Contents/MacOS/Claude" \\
+  --user-data-dir="\$CLAUDE_DATA_DIR" \\
+  --disable-renderer-backgrounding \\
+  --disable-background-timer-throttling \\
+  --disable-backgrounding-occluded-windows \\
+  "\$@"
+LAUNCH
+  chmod 755 "$APP/Contents/MacOS/launcher"
+  "$PY" "$KIT/lib/rehue-icns.py" "$ICON" "$APP/Contents/Resources/AppIcon.icns" "$HUE" >/dev/null
+  codesign -s - --force --deep "$APP" 2>/dev/null
+  codesign --verify --deep "$APP" || die "signature did not verify: $APP"
+  [ "${CC_NO_REGISTER:-0}" = 1 ] || "$LSREG" -f "$APP"
+  cat <<NEXT
+
+Built "Claude $NAME". Four steps only you can do, in this order:
+  1. Quit EVERY Claude window and container. Then:  open -a "Claude $NAME"
+     and sign in. claude:// is one system-wide handler: with two instances up, the sign-in
+     lands in the wrong one.
+  2. Before the first message, pick a folder in the composer. A new container has no recent
+     folders, so sessions otherwise start in a throwaway scratch folder (README).
+  3. Drag "$APP" into the Dock.
+  4. If you use the borders: reload Hammerspoon, or run  claude-container borders
+Then:  claude-container check
+NEXT
+}
+
+cmd_list(){
+  local n h run
+  printf '%-10s %-6s %-8s %-8s %s\n' NAME HUE BORDER RUNNING "CONFIG DIR"
+  discover | while IFS=$'\t' read -r n h; do
+    run=no; running_names | grep -qx "Claude-$n" && run=yes
+    printf '%-10s %-6s #%-7s %-8s %s\n' "$n" "$h" "$(colour_py hex "$h")" "$run" "$(config_of "$n")"
+  done
+}
+
+# pid -> data-dir name ("Claude-<Name>") for every running vendor process, read off its
+# --user-data-dir argument. The path contains spaces, so cut at the next " --".
+pidmap(){
+  ps -axo pid=,command= | awk '
+    /Claude\.app\/Contents\/MacOS\/Claude/ && /--user-data-dir=/ {
+      pid = $1; line = $0; sub(/.*--user-data-dir=/, "", line); sub(/ --.*/, "", line)
+      n = split(line, parts, "/"); print pid, parts[n] }'
+}
+running_names(){ pidmap | awk '{print $2}' | sort -u; }
+
+winmap_bin(){
+  local src="$KIT/lib/winmap.swift" bin="$STATE/winmap"
+  if [ ! -x "$bin" ] || [ "$src" -nt "$bin" ]; then
+    mkdir -p "$STATE"
+    command -v swiftc >/dev/null || die "swiftc not found: xcode-select --install"
+    swiftc -O "$src" -o "$bin" 2>/dev/null || die "could not compile $src"
+  fi
+  printf '%s' "$bin"
+}
+
+cmd_borders(){
+  local B; B="$(command -v borders || true)"; [ -n "$B" ] || die "JankyBorders not installed (README, Borders)"
+  local WM want state applied=0 pid inst hue hex
+  WM="$(winmap_bin)"; mkdir -p "$STATE"; state="$STATE/borders.applied"; touch "$state"
+  want="$(mktemp)"; trap 'rm -f "$want"' RETURN
+  local windows; windows="$("$WM")"
+  local table; table="$(discover)"
+  while read -r pid inst; do
+    [ -n "$pid" ] || continue
+    hue="$(printf '%s\n' "$table" | awk -F'\t' -v n="${inst#Claude-}" '$1==n{print $2}')"
+    [ -n "$hue" ] || continue                      # the vendor app itself, or not a container
+    hex="$(colour_py hex "$hue")"
+    # Window-sized only: Electron keeps small offscreen helper windows too.
+    printf '%s\n' "$windows" | awk -v p="$pid" '$2==p && $6>=400 && $7>=300 {print $1}' |
+      while read -r wid; do echo "$wid 0xff$hex 0x70$hex $BORDER_WIDTH"; done >> "$want"
+  done < <(pidmap)
+  while read -r wid a i w; do
+    [ -n "$wid" ] || continue
+    grep -qxF "$wid $a $i $w" "$state" && continue  # idempotent: only changed windows are pushed
+    "$B" apply-to="$wid" active_color="$a" inactive_color="$i" width="$w" || die "borders apply-to=$wid failed"
+    applied=$((applied+1))
+  done < "$want"
+  cp "$want" "$state"; [ "$applied" -gt 0 ] && echo "applied $applied"; return 0
+}
+
+cmd_check(){
+  local bad=0 n h app extra others near conf
+  warn(){ echo "  PROBLEM $*"; bad=$((bad+1)); }
+  [ -d "$CLAUDE_APP" ] || warn "vendor app missing: $CLAUDE_APP"
+  local table; table="$(discover)"
+  [ -n "$table" ] || { echo "no containers in $APPS_DIR"; return 0; }
+  while IFS=$'\t' read -r n h; do
+    app="$(bundle_of "$n")"; conf="$(config_of "$n")"
+    [ -d "$app" ] || { warn "$n: bundle is not at $(bundle_of "$n") (renamed by hand?)"; continue; }
+    codesign --verify --deep "$app" 2>/dev/null || warn "$n: signature does not verify (see README, Signing)"
+    extra="$(ls "$app/Contents/MacOS" | grep -vx launcher || true)"
+    [ -z "$extra" ] || warn "$n: extra files in Contents/MacOS break signing: $(echo $extra)"
+    grep -qF "Claude-$n\"" "$app/Contents/MacOS/launcher" || warn "$n: launcher does not point at data dir Claude-$n"
+    if [ -f "$conf/settings.json" ]; then
+      "$PY" -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if int(d.get("cleanupPeriodDays",0))>=365 else 3)' "$conf/settings.json" 2>/dev/null \
+        || warn "$n: $conf/settings.json is unreadable or keeps transcripts under a year"
+      "$PY" -c 'import json,sys;d=json.load(open(sys.argv[1]));sys.exit(0 if (d.get("env") or {}).get("MCP_DISCOVERY_CACHE")=="1" else 3)' "$conf/settings.json" 2>/dev/null \
+        || warn "$n: $conf/settings.json env MCP_DISCOVERY_CACHE is not \"1\"; an MCP server slow at launch stays failed all session"
+    else warn "$n: no $conf/settings.json, so transcripts are pruned on the default schedule"; fi
+    others="$(printf '%s\n' "$table" | awk -F'\t' -v n="$n" '$1!=n{print $2}' | tr '\n' ' ')"
+    near="$(colour_py nearest "$h" $others)"
+    "$PY" -c "import sys;sys.exit(float('$near')<10)" || warn "$n: colour is hard to tell from another container's (distance $near, want 10+)"
+  done <<< "$table"
+  command -v borders >/dev/null || echo "  note    JankyBorders not installed; containers work, windows just have no coloured ring"
+  [ "$bad" = 0 ] && echo "claude-container check: clean ($(printf '%s\n' "$table" | wc -l | tr -d ' ') containers)" || { echo "claude-container check: $bad problem(s)"; return 1; }
+}
+
+case "${1:-}" in
+  make) shift; cmd_make "$@";;
+  list) cmd_list;;
+  check) cmd_check;;
+  borders) cmd_borders;;
+  suggest-hue) read -r h d <<<"$(colour_py suggest $(taken_hues))"; echo "$h   (distance $d to the nearest existing colour)";;
+  colour|color) [ -n "${2:-}" ] || die "usage: colour <hue>"; colour_py hex "$2";;
+  -h|--help|help|"") sed -n '2,13p' "$SELF";;
+  *) die "unknown command: $1 (try --help)";;
+esac

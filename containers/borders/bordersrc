@@ -1,0 +1,15 @@
+#!/bin/bash
+# JankyBorders base config for claude containers. Copy to ~/.config/borders/bordersrc, then:
+#   brew install FelixKratz/formulae/borders && brew services start borders
+#
+# Every container runs the same vendor binary, so JankyBorders sees them all as app "Claude"
+# and cannot colour them differently by itself. This file rings only Claude windows, in white;
+# `claude-container borders` then recolours each window by id (apply-to=<window-id>).
+# Keep width equal to CC_BORDER_WIDTH (default 12.0). Leave `order` at its default (below).
+borders \
+  style=round \
+  width=12.0 \
+  hidpi=off \
+  whitelist="Claude" \
+  active_color=0xffffffff \
+  inactive_color=0x60ffffff
